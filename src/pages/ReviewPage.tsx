@@ -12,7 +12,6 @@ import {
   DialogContent,
   DialogTitle,
   Divider,
-  MenuItem,
   Stack,
   Table,
   TableBody,
@@ -38,6 +37,17 @@ const severityLabel: Record<IssueSeverity, string> = {
   info: '提示',
 }
 
+const toLocalInputValue = (date: Date): string => {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+const dependencyTypeLabel = {
+  requires: '前置依赖',
+  conflicts: '互斥开关',
+  fallback: '降级路径',
+} as const
+
 export function ReviewPage() {
   const dispatch = useAppDispatch()
   const selectedIds = useAppSelector((state) => state.ui.reviewSelection)
@@ -47,7 +57,8 @@ export function ReviewPage() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [decision, setDecision] = useState<'approved' | 'rejected'>('approved')
   const [comment, setComment] = useState('')
-  const [freezeUntil, setFreezeUntil] = useState('')
+  const defaultFreeze = toLocalInputValue(new Date(Date.now() + 24 * 3600_000))
+  const [freezeUntil, setFreezeUntil] = useState(defaultFreeze)
   const [message, setMessage] = useState('')
 
   useEffect(() => {
@@ -62,6 +73,7 @@ export function ReviewPage() {
     if (!activeFlag) return
     setDecision(value)
     setComment(value === 'approved' ? '规则、依赖、指标与回滚条件均已核对。' : '存在未解决的影响问题，请修改后重新提交。')
+    if (value === 'approved') setFreezeUntil(toLocalInputValue(new Date(Date.now() + 24 * 3600_000)))
     setDialogOpen(true)
   }
 
@@ -74,6 +86,10 @@ export function ReviewPage() {
       setMessage('阻断问题未清零，不能批准发布')
       return
     }
+    if (decision === 'approved' && !freezeUntil) {
+      setMessage('批准时必须设置冻结截止时间')
+      return
+    }
     try {
       await reviewFlag({
         id: activeFlag.id,
@@ -81,14 +97,15 @@ export function ReviewPage() {
           reviewer: '林默',
           decision,
           comment,
-          freezeUntil: freezeUntil || undefined,
+          freezeUntil: decision === 'approved' ? new Date(freezeUntil).toISOString() : undefined,
         },
       }).unwrap()
       setDialogOpen(false)
       dispatch(clearReviewSelection())
-      setMessage(decision === 'approved' ? '已批准发布，状态和影响范围已写入审计日志' : '已驳回并恢复为草稿')
-    } catch {
-      setMessage('审批提交失败，请重试')
+      setMessage(decision === 'approved' ? '已批准发布，冻结截止时间与依赖快照已留存' : '已驳回并恢复为草稿')
+    } catch (error) {
+      const apiError = error as { data?: { message?: string } }
+      setMessage(apiError?.data?.message ?? '审批提交失败，请重试')
     }
   }
 
@@ -101,14 +118,14 @@ export function ReviewPage() {
         <Box>
           <Typography variant="h2">发布影响评审</Typography>
           <Typography color="text.secondary">
-            逐项检查规则冲突、死代码、监控、实验重叠和客户端兼容，条件未满足不能批准。
+            逐项检查规则冲突、死代码、监控、实验重叠和客户端兼容；批准会留存冻结截止时间和依赖快照。
           </Typography>
         </Box>
         <Chip label={`${flags.length} 项待评审`} color="warning" variant="outlined" />
       </Box>
 
       {message && (
-        <Alert severity={message.includes('失败') || message.includes('不能') ? 'error' : 'success'} onClose={() => setMessage('')} sx={{ mb: 2 }}>
+        <Alert severity={message.includes('失败') || message.includes('不能') || message.includes('必须') ? 'error' : 'success'} onClose={() => setMessage('')} sx={{ mb: 2 }}>
           {message}
         </Alert>
       )}
@@ -209,6 +226,27 @@ export function ReviewPage() {
               </Stack>
 
               <Divider sx={{ my: 2 }} />
+              <Typography variant="h3" sx={{ mb: 1 }}>批准后将留存的依赖快照</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                批准瞬间定格前置依赖与互斥开关的运行态；前置被暂停、互斥后启用或配置改动，批准立即失效并退回待复核。
+              </Typography>
+              {activeFlag.dependencies.length === 0 ? (
+                <Alert severity="info">该开关没有配置依赖关系，快照仅记录当前配置版本。</Alert>
+              ) : (
+                <Stack spacing={1}>
+                  {activeFlag.dependencies.map((dependency) => (
+                    <Box key={`${dependency.flagId}-${dependency.type}`} className="guardrail-row">
+                      <Box>
+                        <Chip size="small" label={dependencyTypeLabel[dependency.type]} color={dependency.type === 'conflicts' ? 'error' : dependency.type === 'requires' ? 'primary' : 'default'} variant="outlined" sx={{ mr: 1 }} />
+                        <Typography component="span" variant="body2" fontWeight={700}>{dependency.flagId}</Typography>
+                        <Typography variant="caption" display="block" color="text.secondary">{dependency.condition}</Typography>
+                      </Box>
+                    </Box>
+                  ))}
+                </Stack>
+              )}
+
+              <Divider sx={{ my: 2 }} />
               <Typography variant="h3" sx={{ mb: 1 }}>回滚边界</Typography>
               {activeFlag.rollbackConditions.map((condition) => (
                 <Typography key={condition} variant="body2" sx={{ mb: 0.5 }}>• {condition}</Typography>
@@ -252,19 +290,18 @@ export function ReviewPage() {
           {decision === 'approved' && (
             <>
               <TextField
-                select
-                label="审批冻结策略"
+                label="冻结截止时间（必填）"
+                type="datetime-local"
                 fullWidth
+                required
                 sx={{ mt: 2 }}
                 value={freezeUntil}
                 onChange={(event) => setFreezeUntil(event.target.value)}
-              >
-                <MenuItem value="">不冻结扩大流量</MenuItem>
-                <MenuItem value="2026-10-01 09:00">冻结至 10 月 1 日 09:00</MenuItem>
-                <MenuItem value="2026-10-03 09:00">冻结至 10 月 3 日 09:00</MenuItem>
-              </TextField>
+                helperText="冻结没过去前灰度不能扩量，只能紧急回滚或补充监控"
+                InputLabelProps={{ shrink: true }}
+              />
               <Alert severity="info" sx={{ mt: 2 }}>
-                批准后会记录审批人、意见、配置前后状态和预估受影响用户数。
+                批准后记录审批人、意见、冻结截止时间与依赖运行态快照（共 {activeFlag?.dependencies.length ?? 0} 项），并写入审计日志和影响范围。
               </Alert>
             </>
           )}

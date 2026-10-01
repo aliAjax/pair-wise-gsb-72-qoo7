@@ -54,6 +54,7 @@ const emptyFlag = (): FeatureFlag => ({
   createdAt: now,
   updatedAt: now,
   lastChangedBy: '林默',
+  configVersion: 1,
 })
 
 const operators: Array<{ value: RuleOperator; label: string }> = [
@@ -230,6 +231,17 @@ export function FlagEditorPage() {
               {error}
             </Typography>
           ))}
+        </Alert>
+      )}
+
+      {!isNew && existing?.approval && !existing.approval.valid && (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          <Typography variant="body2" fontWeight={700}>发布批准已失效，开关已退回待复核</Typography>
+          <Typography variant="body2">原因：{existing.approval.invalidatedReason}</Typography>
+          <Typography variant="caption">
+            原批准于 {existing.approval.approvedAt.slice(0, 16).replace('T', ' ')} 由 {existing.approval.reviewer} 做出，冻结截止 {existing.approval.freezeUntil.slice(0, 16).replace('T', ' ')}。
+            保存配置后需要重新提交评审。
+          </Typography>
         </Alert>
       )}
 

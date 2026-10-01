@@ -38,6 +38,9 @@ const actionLabel: Record<string, string> = {
   unfrozen: '解冻',
   'rolled-back': '回滚',
   'rollout-adjusted': '调整灰度',
+  'metric-supplement': '补监控',
+  'approval-invalidated': '批准失效',
+  'batch-operation': '批量操作',
 }
 
 export function AuditPage() {

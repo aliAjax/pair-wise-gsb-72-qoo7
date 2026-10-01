@@ -1,12 +1,17 @@
 import type {
   AuditEvent,
+  ConsoleSettings,
   DashboardData,
+  DependencySnapshotEntry,
   FeatureFlag,
+  FlagApproval,
   ImpactIssue,
   ReviewPayload,
 } from '@/types'
 
 const STORAGE_KEY = 'feature-flag-release-console-v1'
+export const QUEUE_STORAGE_KEY = 'feature-flag-release-console-v1-queue'
+const SETTINGS_STORAGE_KEY = 'feature-flag-release-console-v1-settings'
 
 export interface Database {
   flags: FeatureFlag[]
@@ -49,6 +54,7 @@ const flags: FeatureFlag[] = [
     createdAt: '2026-09-12T14:20:00+08:00',
     updatedAt: '2026-09-29T09:05:00+08:00',
     lastChangedBy: '陈思远',
+    configVersion: 3,
   },
   {
     id: 'flag-102',
@@ -78,6 +84,29 @@ const flags: FeatureFlag[] = [
     createdAt: '2026-08-28T09:30:00+08:00',
     updatedAt: '2026-09-28T16:40:00+08:00',
     lastChangedBy: '周启',
+    configVersion: 5,
+    // 批准留痕：冻结窗口已过，但前置依赖 flag-105 已被暂停（frozen），
+    // 首次加载时会被复核联动判定为失效，退回待评审。
+    approval: {
+      approved: true,
+      reviewer: '林默',
+      comment: '推荐指标与特征服务 SLA 已核对，准予分阶段放量。',
+      approvedAt: '2026-09-26T10:00:00+08:00',
+      freezeUntil: '2026-09-27T10:00:00+08:00',
+      configVersion: 5,
+      dependencySnapshot: [
+        {
+          flagId: 'flag-105',
+          flagKey: 'feature.realtime-profile',
+          type: 'requires',
+          enabled: true,
+          status: 'active',
+          rolloutPercentage: 60,
+          capturedAt: '2026-09-26T10:00:00+08:00',
+        },
+      ],
+      valid: true,
+    },
   },
   {
     id: 'flag-103',
@@ -105,6 +134,7 @@ const flags: FeatureFlag[] = [
     createdAt: '2026-09-18T11:10:00+08:00',
     updatedAt: '2026-09-28T18:20:00+08:00',
     lastChangedBy: '周航',
+    configVersion: 2,
   },
   {
     id: 'flag-104',
@@ -128,6 +158,7 @@ const flags: FeatureFlag[] = [
     createdAt: '2026-06-12T10:00:00+08:00',
     updatedAt: '2026-09-25T12:30:00+08:00',
     lastChangedBy: '韩秋',
+    configVersion: 8,
   },
   {
     id: 'flag-105',
@@ -151,6 +182,7 @@ const flags: FeatureFlag[] = [
     createdAt: '2026-05-18T13:40:00+08:00',
     updatedAt: '2026-09-29T08:50:00+08:00',
     lastChangedBy: '郭宁',
+    configVersion: 4,
   },
   {
     id: 'flag-106',
@@ -174,6 +206,7 @@ const flags: FeatureFlag[] = [
     createdAt: '2026-08-20T10:15:00+08:00',
     updatedAt: '2026-09-28T15:48:00+08:00',
     lastChangedBy: '梁琪',
+    configVersion: 6,
   },
   {
     id: 'flag-107',
@@ -197,6 +230,7 @@ const flags: FeatureFlag[] = [
     createdAt: '2026-08-10T16:20:00+08:00',
     updatedAt: '2026-09-27T11:12:00+08:00',
     lastChangedBy: '赵岚',
+    configVersion: 2,
   },
   {
     id: 'flag-108',
@@ -220,6 +254,7 @@ const flags: FeatureFlag[] = [
     createdAt: '2025-12-10T09:00:00+08:00',
     updatedAt: '2026-09-29T09:10:00+08:00',
     lastChangedBy: '沈宁',
+    configVersion: 9,
   },
 ]
 
@@ -367,26 +402,221 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const seedDatabase = (): Database => ({ flags, audit, issues })
+const seedDatabase = (): Database => ({ flags, audit, issues })
+
+/** 兼容旧版本本地数据：补齐新增字段。 */
+const migrate = (database: Database): Database => {
+  let changed = false
+  const nextFlags = database.flags.map((flag) => {
+    let next = flag
+    if (next.configVersion === undefined) {
+      next = { ...next, configVersion: 1 }
+      changed = true
+    }
+    return next
+  })
+  const next = changed ? { ...database, flags: nextFlags } : database
+  return next
+}
 
 export const readDatabase = (): Database => {
+  if (typeof localStorage === 'undefined') return seedDatabase()
   const raw = localStorage.getItem(STORAGE_KEY)
   if (!raw) {
-    const seed = seedDatabase()
-    writeDatabase(seed)
+    const seed = migrate(seedDatabase())
+    persistDatabase(seed)
     return seed
   }
   try {
-    return JSON.parse(raw) as Database
+    return migrate(JSON.parse(raw) as Database)
   } catch {
-    const seed = seedDatabase()
-    writeDatabase(seed)
+    const seed = migrate(seedDatabase())
+    persistDatabase(seed)
     return seed
   }
 }
 
-export const writeDatabase = (database: Database): void => {
+/** 直接写入主存储；受“模拟写入失败”开关影响。 */
+const persistDatabase = (database: Database): void => {
+  if (readSettings().simulateFailures) {
+    throw new Error('模拟存储写入失败：本地存储不可用')
+  }
   localStorage.setItem(STORAGE_KEY, JSON.stringify(database))
+}
+
+export const writeDatabase = (database: Database): void => {
+  persistDatabase(database)
+}
+
+/* ------------------------------------------------------------------ */
+/* 冻结窗口                                                            */
+/* ------------------------------------------------------------------ */
+
+/** 是否处于冻结期：手动冻结状态，或批准附带的冻结截止时间尚未过去。 */
+export const isInFreezeWindow = (flag: FeatureFlag, now = new Date()): boolean => {
+  if (flag.status === 'frozen') return true
+  if (flag.approval?.valid && new Date(flag.approval.freezeUntil).getTime() > now.getTime()) return true
+  return false
+}
+
+const estimateAffectedUsers = (percentage: number): number =>
+  Math.max(0, Math.round(980000 * (percentage / 100)))
+
+const addAudit = (
+  db: Database,
+  event: Omit<AuditEvent, 'id' | 'createdAt'> & { id?: string; createdAt?: string },
+): void => {
+  if (event.dedupeKey && db.audit.some((item) => item.dedupeKey === event.dedupeKey)) return
+  db.audit.unshift({
+    id: event.id ?? `audit-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    createdAt: event.createdAt ?? new Date().toISOString(),
+    ...event,
+  })
+}
+
+/* ------------------------------------------------------------------ */
+/* 批准失效联动（复核）                                                */
+/* ------------------------------------------------------------------ */
+
+const describeFlag = (flag: FeatureFlag): string => {
+  const statusLabel: Record<string, string> = {
+    draft: '草稿',
+    review: '待评审',
+    active: '已发布',
+    frozen: '已暂停/冻结',
+    'rolled-back': '已回滚',
+  }
+  return `${flag.key}（${statusLabel[flag.status] ?? flag.status}${flag.enabled ? `，${flag.rolloutPercentage}%` : '，未启用'}）`
+}
+
+export interface InvalidationResult {
+  invalidated: Array<{ flag: FeatureFlag; reason: string }>
+}
+
+/**
+ * 复核所有批准：前置依赖被暂停、互斥开关被启用、配置被改动时，
+ * 相关批准立即失效，运行阶段退回待评审。
+ * 就地修改传入的 db，可选择为每次失效补写审计事件。
+ */
+export const reconcileApprovals = (
+  db: Database,
+  options: { appendAudit?: boolean; actor?: string; at?: string; operationId?: string } = {},
+): InvalidationResult => {
+  const { appendAudit = true, actor = '系统复核', at = new Date().toISOString(), operationId } = options
+  const invalidated: InvalidationResult['invalidated'] = []
+  const byId = new Map(db.flags.map((flag) => [flag.id, flag]))
+
+  for (const flag of db.flags) {
+    const approval = flag.approval
+    if (!approval?.valid) continue
+
+    let reason = ''
+    if (approval.configVersion !== flag.configVersion) {
+      reason = `配置已被改动（配置版本 ${approval.configVersion} → ${flag.configVersion}），批准基线失效`
+    } else {
+      for (const dependency of flag.dependencies) {
+        const target = byId.get(dependency.flagId)
+        if (!target) {
+          reason = `前置依赖 ${dependency.flagId} 已不存在，批准基线失效`
+          break
+        }
+        const snapshot = approval.dependencySnapshot.find((entry) => entry.flagId === target.id)
+        if (dependency.type === 'requires' && (target.status === 'frozen' || target.status === 'rolled-back' || !target.enabled)) {
+          reason = `前置依赖已被暂停或停用：${describeFlag(target)}`
+          break
+        }
+        if (dependency.type === 'conflicts' && target.enabled) {
+          reason = `互斥开关在批准后被启用：${describeFlag(target)}`
+          break
+        }
+        if (snapshot) {
+          if (dependency.type === 'requires' && snapshot.enabled && !target.enabled) {
+            reason = `前置依赖已被停用：${describeFlag(target)}`
+            break
+          }
+          if (dependency.type === 'conflicts' && !snapshot.enabled && target.enabled) {
+            reason = `互斥开关在批准后被启用：${describeFlag(target)}`
+            break
+          }
+        }
+      }
+    }
+
+    if (reason) {
+      approval.valid = false
+      approval.invalidatedAt = at
+      approval.invalidatedReason = reason
+      if (flag.status === 'active') flag.status = 'review'
+      flag.rolloutSteps = flag.rolloutSteps.map((step) =>
+        step.status === 'running' ? { ...step, status: 'paused' as const } : step,
+      )
+      flag.updatedAt = at
+      flag.lastChangedBy = actor
+      invalidated.push({ flag, reason })
+      if (appendAudit) {
+        addAudit(db, {
+          id: `audit-invalidate-${flag.id}-${approval.approvedAt}`,
+          flagId: flag.id,
+          flagKey: flag.key,
+          action: 'approval-invalidated',
+          actor,
+          summary: `发布批准已失效：${reason}，运行阶段退回待复核。`,
+          before: 'active（批准有效）',
+          after: 'review（待复核）',
+          affectedUsers: estimateAffectedUsers(flag.rolloutPercentage),
+          createdAt: at,
+          dedupeKey: `invalidate:${flag.id}:${approval.approvedAt}`,
+          operationId,
+        })
+      }
+    }
+  }
+  return { invalidated }
+}
+
+/** 执行一次开关变更，统一在提交前跑复核联动并写入主存储。 */
+const commit = (mutate: (db: Database) => void): Database => {
+  const db = readDatabase()
+  mutate(db)
+  reconcileApprovals(db)
+  persistDatabase(db)
+  return db
+}
+
+/* ------------------------------------------------------------------ */
+/* 审批：冻结截止时间 + 依赖快照                                       */
+/* ------------------------------------------------------------------ */
+
+const buildDependencySnapshot = (db: Database, flag: FeatureFlag, capturedAt: string): DependencySnapshotEntry[] =>
+  flag.dependencies.map((dependency) => {
+    const target = db.flags.find((item) => item.id === dependency.flagId)
+    return {
+      flagId: dependency.flagId,
+      flagKey: target?.key ?? dependency.flagId,
+      type: dependency.type,
+      enabled: target?.enabled ?? false,
+      status: target?.status ?? 'draft',
+      rolloutPercentage: target?.rolloutPercentage ?? 0,
+      capturedAt,
+    }
+  })
+
+/** 批准前校验前置/互斥依赖的当前运行态。 */
+export const validateApprovalDependencies = (
+  db: Database,
+  flag: FeatureFlag,
+): string | null => {
+  for (const dependency of flag.dependencies) {
+    const target = db.flags.find((item) => item.id === dependency.flagId)
+    if (!target) return `依赖开关 ${dependency.flagId} 不存在`
+    if (dependency.type === 'requires' && (!target.enabled || target.status === 'frozen' || target.status === 'rolled-back')) {
+      return `前置依赖 ${target.name} 当前为${target.enabled ? '暂停' : '停用'}状态，不能批准`
+    }
+    if (dependency.type === 'conflicts' && target.enabled) {
+      return `互斥开关 ${target.name} 当前已启用（${target.rolloutPercentage}%），不能批准`
+    }
+  }
+  return null
 }
 
 export const applyReview = (flagId: string, payload: ReviewPayload): FeatureFlag => {
@@ -394,63 +624,296 @@ export const applyReview = (flagId: string, payload: ReviewPayload): FeatureFlag
   const flag = db.flags.find((item) => item.id === flagId)
   if (!flag) throw new Error('功能开关不存在')
   const before = flag.status
-  flag.status = payload.decision === 'approved' ? 'active' : 'draft'
-  flag.enabled = payload.decision === 'approved'
-  flag.updatedAt = new Date().toISOString()
-  flag.lastChangedBy = payload.reviewer
-  db.audit.unshift({
-    id: `audit-${Date.now()}`,
-    flagId,
-    flagKey: flag.key,
-    action: payload.decision,
-    actor: payload.reviewer,
-    summary: payload.comment,
-    before,
-    after: flag.status,
-    affectedUsers: Math.round(120000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
-  })
-  if (payload.freezeUntil && payload.decision === 'approved') {
-    flag.rollbackConditions.push(`冻结至 ${payload.freezeUntil}，期间禁止扩大流量`)
+  const timestamp = new Date().toISOString()
+
+  if (payload.decision === 'approved') {
+    if (!payload.freezeUntil) throw new Error('批准时必须设置冻结截止时间')
+    if (new Date(payload.freezeUntil).getTime() <= Date.now()) {
+      throw new Error('冻结截止时间必须晚于当前时间')
+    }
+    const dependencyError = validateApprovalDependencies(db, flag)
+    if (dependencyError) throw new Error(dependencyError)
+
+    const snapshot = buildDependencySnapshot(db, flag, timestamp)
+    const approval: FlagApproval = {
+      approved: true,
+      reviewer: payload.reviewer,
+      comment: payload.comment,
+      approvedAt: timestamp,
+      freezeUntil: new Date(payload.freezeUntil).toISOString(),
+      configVersion: flag.configVersion,
+      dependencySnapshot: snapshot,
+      valid: true,
+    }
+    flag.status = 'active'
+    flag.enabled = true
+    flag.approval = approval
+    addAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'approved',
+      actor: payload.reviewer,
+      summary: `${payload.comment}｜冻结截止 ${approval.freezeUntil}，已留存 ${snapshot.length} 项依赖快照。`,
+      before,
+      after: `active / 冻结至 ${approval.freezeUntil}`,
+      affectedUsers: estimateAffectedUsers(flag.rolloutPercentage),
+      createdAt: timestamp,
+    })
+  } else {
+    flag.status = 'draft'
+    flag.enabled = false
+    if (flag.approval) {
+      flag.approval = {
+        ...flag.approval,
+        valid: false,
+        invalidatedAt: timestamp,
+        invalidatedReason: '评审被驳回',
+      }
+    }
+    addAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'rejected',
+      actor: payload.reviewer,
+      summary: payload.comment,
+      before,
+      after: 'draft',
+      affectedUsers: 0,
+      createdAt: timestamp,
+    })
   }
-  writeDatabase(db)
+
+  flag.updatedAt = timestamp
+  flag.lastChangedBy = payload.reviewer
+  reconcileApprovals(db)
+  persistDatabase(db)
   return flag
 }
 
-export const rollbackFlag = (flagId: string, actor: string, reason: string): FeatureFlag => {
-  const db = readDatabase()
-  const flag = db.flags.find((item) => item.id === flagId)
-  if (!flag) throw new Error('功能开关不存在')
-  const before = `${flag.status} / ${flag.rolloutPercentage}%`
-  flag.status = 'rolled-back'
-  flag.enabled = false
-  flag.rolloutPercentage = 0
-  flag.updatedAt = new Date().toISOString()
-  flag.lastChangedBy = actor
-  flag.rolloutSteps.forEach((step) => {
-    if (step.status === 'running') step.status = 'paused'
+/* ------------------------------------------------------------------ */
+/* 灰度运行：推进（受冻结约束）、冻结、补监控、回滚                    */
+/* ------------------------------------------------------------------ */
+
+export class FreezeWindowError extends Error {}
+
+export const advanceRollout = (flagId: string, actor: string): FeatureFlag => {
+  let updated: FeatureFlag | undefined
+  commit((db) => {
+    const flag = db.flags.find((item) => item.id === flagId)
+    if (!flag) throw new Error('功能开关不存在')
+    if (isInFreezeWindow(flag)) {
+      throw new FreezeWindowError(
+        '冻结窗口尚未过去，灰度阶段不能扩量；只能紧急回滚或补充监控。',
+      )
+    }
+    const currentIndex = flag.rolloutSteps.findIndex((step) => step.status === 'running')
+    if (currentIndex < 0 || currentIndex >= flag.rolloutSteps.length - 1) {
+      throw new Error('没有可推进的灰度阶段')
+    }
+    const beforePercentage = flag.rolloutPercentage
+    flag.rolloutSteps = flag.rolloutSteps.map((step, index) => ({
+      ...step,
+      status:
+        index === currentIndex
+          ? ('completed' as const)
+          : index === currentIndex + 1
+            ? ('running' as const)
+            : step.status,
+    }))
+    const nextPercentage =
+      flag.rolloutSteps.find((step) => step.status === 'running')?.percentage ?? beforePercentage
+    flag.rolloutPercentage = nextPercentage
+    flag.enabled = true
+    flag.status = 'active'
+    flag.updatedAt = new Date().toISOString()
+    flag.lastChangedBy = actor
+    addAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'rollout-adjusted',
+      actor,
+      summary: `冻结窗口已过，灰度由 ${beforePercentage}% 推进至 ${nextPercentage}%。`,
+      before: `${beforePercentage}%`,
+      after: `${nextPercentage}%`,
+      affectedUsers: estimateAffectedUsers(nextPercentage),
+    })
+    updated = flag
   })
-  db.audit.unshift({
-    id: `audit-${Date.now()}`,
-    flagId,
-    flagKey: flag.key,
-    action: 'rolled-back',
-    actor,
-    summary: reason,
-    before,
-    after: 'rolled-back / 0%',
-    affectedUsers: Math.round(980000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
-  })
-  writeDatabase(db)
-  return flag
+  return updated as FeatureFlag
 }
+
+export const freezeFlag = (
+  flagId: string,
+  actor: string,
+  reason: string,
+  context: { operationId?: string; dedupeKey?: string } = {},
+): FeatureFlag => {
+  let updated: FeatureFlag | undefined
+  commit((db) => {
+    const flag = db.flags.find((item) => item.id === flagId)
+    if (!flag) throw new Error('功能开关不存在')
+    if (flag.status === 'frozen') {
+      updated = flag
+      return
+    }
+    const before = `${flag.status} / ${flag.rolloutPercentage}%`
+    flag.status = 'frozen'
+    flag.rolloutSteps = flag.rolloutSteps.map((step) =>
+      step.status === 'running' ? { ...step, status: 'paused' as const } : step,
+    )
+    flag.updatedAt = new Date().toISOString()
+    flag.lastChangedBy = actor
+    addAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'frozen',
+      actor,
+      summary: reason,
+      before,
+      after: 'frozen',
+      affectedUsers: estimateAffectedUsers(flag.rolloutPercentage),
+      operationId: context.operationId,
+      dedupeKey: context.dedupeKey,
+    })
+    updated = flag
+  })
+  return updated as FeatureFlag
+}
+
+export const supplementMetrics = (
+  flagId: string,
+  actor: string,
+  metrics: string[],
+  reason: string,
+  context: { operationId?: string; dedupeKey?: string } = {},
+): FeatureFlag => {
+  let updated: FeatureFlag | undefined
+  commit((db) => {
+    const flag = db.flags.find((item) => item.id === flagId)
+    if (!flag) throw new Error('功能开关不存在')
+    const additions = metrics.map((metric) => metric.trim()).filter(
+      (metric) => metric.length > 0 && !flag.metricNames.includes(metric),
+    )
+    if (additions.length === 0) {
+      updated = flag
+      return
+    }
+    // 补监控不改配置版本、不使批准失效；冻结窗口下唯一允许的“增强”动作。
+    flag.metricNames = [...flag.metricNames, ...additions]
+    flag.updatedAt = new Date().toISOString()
+    flag.lastChangedBy = actor
+    addAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'metric-supplement',
+      actor,
+      summary: `${reason}，补充监控指标 ${additions.join('、')}。`,
+      before: `${flag.metricNames.length - additions.length} 个指标`,
+      after: `${flag.metricNames.length} 个指标`,
+      affectedUsers: estimateAffectedUsers(flag.rolloutPercentage),
+      operationId: context.operationId,
+      dedupeKey: context.dedupeKey,
+    })
+    updated = flag
+  })
+  return updated as FeatureFlag
+}
+
+export const rollbackFlag = (
+  flagId: string,
+  actor: string,
+  reason: string,
+  context: { operationId?: string; dedupeKey?: string } = {},
+): FeatureFlag => {
+  let updated: FeatureFlag | undefined
+  commit((db) => {
+    const flag = db.flags.find((item) => item.id === flagId)
+    if (!flag) throw new Error('功能开关不存在')
+    if (flag.status === 'rolled-back') {
+      updated = flag
+      return
+    }
+    const previousPercentage = flag.rolloutPercentage
+    const before = `${flag.status} / ${previousPercentage}%`
+    flag.status = 'rolled-back'
+    flag.enabled = false
+    flag.rolloutPercentage = 0
+    flag.updatedAt = new Date().toISOString()
+    flag.lastChangedBy = actor
+    if (flag.approval?.valid) {
+      flag.approval.valid = false
+      flag.approval.invalidatedAt = new Date().toISOString()
+      flag.approval.invalidatedReason = '执行紧急回滚'
+    }
+    flag.rolloutSteps = flag.rolloutSteps.map((step) =>
+      step.status === 'running' ? { ...step, status: 'paused' as const } : step,
+    )
+    addAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'rolled-back',
+      actor,
+      summary: reason,
+      before,
+      after: 'rolled-back / 0%',
+      affectedUsers: estimateAffectedUsers(previousPercentage),
+      operationId: context.operationId,
+      dedupeKey: context.dedupeKey,
+    })
+    updated = flag
+  })
+  return updated as FeatureFlag
+}
+
+/* ------------------------------------------------------------------ */
+/* 设置：模拟写入失败演练开关（独立存储，不随主库失败）                */
+/* ------------------------------------------------------------------ */
+
+export const readSettings = (): ConsoleSettings => {
+  if (typeof localStorage === 'undefined') return { simulateFailures: false }
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY)
+    return raw ? (JSON.parse(raw) as ConsoleSettings) : { simulateFailures: false }
+  } catch {
+    return { simulateFailures: false }
+  }
+}
+
+export const writeSettings = (settings: ConsoleSettings): void => {
+  localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings))
+}
+
+/* ------------------------------------------------------------------ */
+/* 启动联动复核                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 应用启动时执行一次复核并落库：让“前置被暂停 / 互斥后启用 / 配置改动”
+ * 立即让相关批准失效、退回待评审，并留下审计事件。
+ * 演练写入失败时静默跳过，界面仍会在读取时做内存态复核。
+ */
+export const reconcileOnStartup = (): InvalidationResult => {
+  try {
+    const db = readDatabase()
+    const result = reconcileApprovals(db, { appendAudit: true, actor: '系统复核' })
+    if (result.invalidated.length > 0) persistDatabase(db)
+    return result
+  } catch {
+    return { invalidated: [] }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 概览数据                                                            */
+/* ------------------------------------------------------------------ */
 
 export const getDashboardStats = (): DashboardData => {
   const db = readDatabase()
+  // 内存态复核：让概览立即反映“前置暂停 → 批准失效 → 待复核”，不落库。
+  reconcileApprovals(db, { appendAudit: false })
   return {
-    activeFlags: db.flags.filter((flag) => flag.enabled).length,
-    pendingReview: db.flags.filter((flag) => flag.status === 'review').length + 2,
+    activeFlags: db.flags.filter((flag) => flag.enabled && flag.status === 'active').length,
+    pendingReview: db.flags.filter((flag) => flag.status === 'review').length,
     blockerIssues: db.issues.filter((issue) => issue.severity === 'blocker' && !issue.resolved).length,
     affectedUsers: 5246900,
     environmentDiff: [
