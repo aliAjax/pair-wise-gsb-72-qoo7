@@ -1,18 +1,193 @@
 import type {
+  ApprovalRecord,
   AuditEvent,
   DashboardData,
+  DependencySnapshotEntry,
   FeatureFlag,
   ImpactIssue,
+  OutboxOperation,
+  OutboxStep,
+  ReleaseReport,
   ReviewPayload,
 } from '@/types'
 
 const STORAGE_KEY = 'feature-flag-release-console-v1'
+/** 故障注入开关：开启后所有业务写入都会抛错，用于验证 outbox 失败保留与重试 */
+const FAULT_KEY = 'feature-flag-release-console-fault-v1'
 
 export interface Database {
   flags: FeatureFlag[]
   audit: AuditEvent[]
   issues: ImpactIssue[]
+  outbox: OutboxOperation[]
+  reports: ReleaseReport[]
 }
+
+const nowIso = () => new Date().toISOString()
+
+// ---------------------------------------------------------------------------
+// 故障注入（仅用于演示写入失败后的续跑行为）
+// ---------------------------------------------------------------------------
+
+export const isWriteFaultEnabled = (): boolean => localStorage.getItem(FAULT_KEY) === 'on'
+
+export const setWriteFaultEnabled = (enabled: boolean): void => {
+  if (enabled) localStorage.setItem(FAULT_KEY, 'on')
+  else localStorage.removeItem(FAULT_KEY)
+}
+
+/** 不经过故障开关的底层写入，outbox 自身的入队必须始终可落盘 */
+const persistDatabase = (database: Database): void => {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(database))
+}
+
+/** 业务统一写入入口：故障注入开启时抛错，调用方需保留未完成项并重试 */
+export const writeDatabase = (database: Database): void => {
+  if (isWriteFaultEnabled()) throw new Error('本地存储写入失败（故障注入开启）')
+  persistDatabase(database)
+}
+
+// ---------------------------------------------------------------------------
+// 审批快照与配置指纹
+// ---------------------------------------------------------------------------
+
+/** 捕获某个开关在批准时刻的依赖快照（前置 / 互斥 / 降级目标的启用状态） */
+export const captureDependencySnapshot = (
+  flag: FeatureFlag,
+  flagsById: Map<string, FeatureFlag>,
+): DependencySnapshotEntry[] => {
+  const capturedAt = nowIso()
+  return flag.dependencies.map((dependency) => {
+    const target = flagsById.get(dependency.flagId)
+    return {
+      flagId: dependency.flagId,
+      flagKey: target?.key ?? dependency.flagId,
+      type: dependency.type,
+      enabled: target?.enabled ?? false,
+      status: target?.status ?? 'draft',
+      capturedAt,
+    }
+  })
+}
+
+/**
+ * 发布相关配置的指纹：
+ * 仅包含审批约束覆盖的发布面（受众、地区、版本、依赖、回滚条件、灰度阶段定义）。
+ * 补监控（metricNames）与正常放量推进不参与，避免把冻结期允许的操作误判为配置漂移。
+ */
+export const buildConfigHash = (flag: FeatureFlag): string =>
+  JSON.stringify({
+    key: flag.key,
+    environment: flag.environment,
+    audienceRules: flag.audienceRules,
+    regions: flag.regions,
+    minClientVersion: flag.minClientVersion,
+    dependencies: flag.dependencies,
+    rollbackConditions: flag.rollbackConditions,
+    deadCodeStatus: flag.deadCodeStatus,
+    rolloutSteps: flag.rolloutSteps.map((step) => ({
+      percentage: step.percentage,
+      audience: step.audience,
+      guardrails: step.guardrails,
+    })),
+  })
+
+/** 冻结截止时间是否仍未过去（无冻结记录视为不在冻结期） */
+export const isFreezeActive = (flag: FeatureFlag, at: Date = new Date()): boolean => {
+  const freezeUntil = flag.approval?.freezeUntil
+  if (!freezeUntil) return false
+  return new Date(freezeUntil).getTime() > at.getTime()
+}
+
+/** 审批是否仍然有效（未被失效、且冻结截止时间已随批准一并留存） */
+export const isApprovalValid = (flag: FeatureFlag): boolean =>
+  Boolean(flag.approval && !flag.approval.invalidated)
+
+// ---------------------------------------------------------------------------
+// 审批失效
+// ---------------------------------------------------------------------------
+
+const pauseRunningSteps = (flag: FeatureFlag): void => {
+  flag.rolloutSteps.forEach((step) => {
+    if (step.status === 'running') step.status = 'paused'
+  })
+}
+
+export interface InvalidationResult {
+  invalidated: boolean
+  reason?: string
+}
+
+/** 使某个开关的审批立即失效：运行阶段退回待复核，但保留当前灰度比例 */
+export const invalidateApproval = (
+  db: Database,
+  flag: FeatureFlag,
+  reason: string,
+  actor = '系统联动',
+): InvalidationResult => {
+  if (!flag.approval || flag.approval.invalidated) return { invalidated: false }
+  const before = `${flag.status} / ${flag.rolloutPercentage}%`
+  flag.approval.invalidated = true
+  flag.approval.invalidatedAt = nowIso()
+  flag.approval.invalidatedReason = reason
+  flag.status = 'review'
+  pauseRunningSteps(flag)
+  flag.updatedAt = nowIso()
+  db.audit.unshift({
+    id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    flagId: flag.id,
+    flagKey: flag.key,
+    action: 'approval-invalidated',
+    actor,
+    summary: `审批失效：${reason}，运行阶段已退回待复核，需重新批准后方可扩量。`,
+    before,
+    after: 'review（待复核）',
+    affectedUsers: Math.round(900000 * (flag.rolloutPercentage / 100)),
+    createdAt: nowIso(),
+  })
+  return { invalidated: true, reason }
+}
+
+/**
+ * 审批一致性扫描：对仍有效的审批检查三类漂移
+ *  1. 审批后发布配置被改动（configHash 不一致）
+ *  2. 前置依赖被暂停 / 关闭
+ *  3. 互斥开关在审批之后才被启用
+ */
+export const runApprovalSweep = (db: Database): void => {
+  const flagsById = new Map(db.flags.map((flag) => [flag.id, flag]))
+  for (const flag of db.flags) {
+    if (!flag.approval || flag.approval.invalidated) continue
+    const reasons: string[] = []
+
+    if (buildConfigHash(flag) !== flag.approval.configHash) {
+      reasons.push('批准后发布配置发生改动（受众/依赖/版本/回滚条件/灰度阶段）')
+    }
+
+    for (const snapshot of flag.approval.dependencySnapshot) {
+      const target = flagsById.get(snapshot.flagId)
+      if (snapshot.type === 'requires') {
+        if (!target || target.status === 'frozen' || target.status === 'rolled-back' || !target.enabled) {
+          reasons.push(
+            `前置依赖 ${snapshot.flagKey} 已暂停（${target ? `${target.status}/${target.enabled ? '启用' : '关闭'}` : '不存在'}）`,
+          )
+        }
+      } else if (snapshot.type === 'conflicts') {
+        if (target && !snapshot.enabled && target.enabled) {
+          reasons.push(`互斥开关 ${snapshot.flagKey} 在批准后才启用`)
+        }
+      }
+    }
+
+    if (reasons.length > 0) {
+      invalidateApproval(db, flag, reasons.join('；'))
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 种子数据
+// ---------------------------------------------------------------------------
 
 const flags: FeatureFlag[] = [
   {
@@ -223,6 +398,29 @@ const flags: FeatureFlag[] = [
   },
 ]
 
+// flag-102 在 9-26 已获得带冻结截止时间的批准；其前置依赖 flag-105 随后于 9-29 被冻结，
+// 首次读取触发一致性扫描时会自动使该审批失效、退回待复核（演示审批失效联动）。
+const approval102: ApprovalRecord = {
+  id: 'approval-102-1',
+  reviewer: '林默',
+  approvedAt: '2026-09-26T15:10:00+08:00',
+  comment: '指标守护与回滚阈值齐备，批准放量至 35%；冻结期至 9 月 28 日。',
+  freezeUntil: '2026-09-28T09:00:00+08:00',
+  dependencySnapshot: [
+    {
+      flagId: 'flag-105',
+      flagKey: 'feature.realtime-profile',
+      type: 'requires',
+      enabled: true,
+      status: 'active',
+      capturedAt: '2026-09-26T15:10:00+08:00',
+    },
+  ],
+  configHash: '',
+}
+flags[1].approval = approval102
+approval102.configHash = buildConfigHash(flags[1])
+
 const issues: ImpactIssue[] = [
   {
     id: 'issue-1',
@@ -365,73 +563,150 @@ const audit: AuditEvent[] = [
     affectedUsers: 3200000,
     createdAt: '2026-09-25T12:30:00+08:00',
   },
+  {
+    id: 'audit-7',
+    flagId: 'flag-102',
+    flagKey: 'catalog.smart-recommendation',
+    action: 'approved',
+    actor: '林默',
+    summary: '批准放量至 35%，冻结截止 2026-09-28 09:00，并留存前置依赖快照。',
+    before: 'review',
+    after: 'active / freeze-until 2026-09-28T09:00',
+    affectedUsers: 812430,
+    createdAt: '2026-09-26T15:10:00+08:00',
+  },
 ]
 
-export const seedDatabase = (): Database => ({ flags, audit, issues })
+export const seedDatabase = (): Database => ({ flags, audit, issues, outbox: [], reports: [] })
+
+// ---------------------------------------------------------------------------
+// 读取：兼容旧版本数据，并在读取时执行审批一致性扫描
+// ---------------------------------------------------------------------------
 
 export const readDatabase = (): Database => {
   const raw = localStorage.getItem(STORAGE_KEY)
+  let parsed: Database
   if (!raw) {
-    const seed = seedDatabase()
-    writeDatabase(seed)
-    return seed
+    parsed = seedDatabase()
+  } else {
+    try {
+      const value = JSON.parse(raw) as Partial<Database>
+      parsed = {
+        flags: value.flags ?? [],
+        audit: value.audit ?? [],
+        issues: value.issues ?? [],
+        outbox: value.outbox ?? [],
+        reports: value.reports ?? [],
+      }
+    } catch {
+      parsed = seedDatabase()
+    }
   }
-  try {
-    return JSON.parse(raw) as Database
-  } catch {
-    const seed = seedDatabase()
-    writeDatabase(seed)
-    return seed
+  // 全局联动扫描：发现依赖暂停 / 互斥后启用 / 配置漂移时就地失效审批并落盘
+  const before = JSON.stringify(parsed)
+  runApprovalSweep(parsed)
+  if (JSON.stringify(parsed) !== before || !raw) {
+    // 首次初始化或扫描产生失效结果时一并落盘（底层写入，避免故障注入阻断初始化）
+    try {
+      persistDatabase(parsed)
+    } catch {
+      // 落盘失败时本次内存状态仍生效，下次读取会重新扫描
+    }
   }
+  return parsed
 }
 
-export const writeDatabase = (database: Database): void => {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(database))
-}
+// ---------------------------------------------------------------------------
+// 审批
+// ---------------------------------------------------------------------------
 
 export const applyReview = (flagId: string, payload: ReviewPayload): FeatureFlag => {
   const db = readDatabase()
   const flag = db.flags.find((item) => item.id === flagId)
   if (!flag) throw new Error('功能开关不存在')
   const before = flag.status
-  flag.status = payload.decision === 'approved' ? 'active' : 'draft'
-  flag.enabled = payload.decision === 'approved'
-  flag.updatedAt = new Date().toISOString()
-  flag.lastChangedBy = payload.reviewer
-  db.audit.unshift({
-    id: `audit-${Date.now()}`,
-    flagId,
-    flagKey: flag.key,
-    action: payload.decision,
-    actor: payload.reviewer,
-    summary: payload.comment,
-    before,
-    after: flag.status,
-    affectedUsers: Math.round(120000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
-  })
-  if (payload.freezeUntil && payload.decision === 'approved') {
-    flag.rollbackConditions.push(`冻结至 ${payload.freezeUntil}，期间禁止扩大流量`)
+  const timestamp = nowIso()
+
+  if (payload.decision === 'approved') {
+    const flagsById = new Map(db.flags.map((item) => [item.id, item]))
+    const approval: ApprovalRecord = {
+      id: `approval-${Date.now()}`,
+      reviewer: payload.reviewer,
+      approvedAt: timestamp,
+      comment: payload.comment,
+      freezeUntil: payload.freezeUntil,
+      dependencySnapshot: captureDependencySnapshot(flag, flagsById),
+      configHash: buildConfigHash(flag),
+    }
+    flag.approval = approval
+    flag.status = 'active'
+    flag.enabled = true
+    flag.updatedAt = timestamp
+    flag.lastChangedBy = payload.reviewer
+    db.audit.unshift({
+      id: `audit-${Date.now()}`,
+      flagId,
+      flagKey: flag.key,
+      action: 'approved',
+      actor: payload.reviewer,
+      summary: payload.freezeUntil
+        ? `${payload.comment}；冻结截止 ${payload.freezeUntil}，冻结期内禁止扩量，仅可回滚或补监控。`
+        : payload.comment,
+      before,
+      after: payload.freezeUntil ? `active / freeze-until ${payload.freezeUntil}` : 'active',
+      affectedUsers: Math.round(900000 * (flag.rolloutPercentage / 100)),
+      createdAt: timestamp,
+    })
+  } else {
+    flag.status = 'draft'
+    flag.enabled = false
+    flag.updatedAt = timestamp
+    flag.lastChangedBy = payload.reviewer
+    db.audit.unshift({
+      id: `audit-${Date.now()}`,
+      flagId,
+      flagKey: flag.key,
+      action: 'rejected',
+      actor: payload.reviewer,
+      summary: payload.comment,
+      before,
+      after: 'draft',
+      affectedUsers: 0,
+      createdAt: timestamp,
+    })
   }
+
   writeDatabase(db)
   return flag
 }
 
-export const rollbackFlag = (flagId: string, actor: string, reason: string): FeatureFlag => {
-  const db = readDatabase()
+// ---------------------------------------------------------------------------
+// 回滚（单开关；也供 outbox 步骤复用，复用传入的 db）
+// ---------------------------------------------------------------------------
+
+export const rollbackFlagInto = (
+  db: Database,
+  flagId: string,
+  actor: string,
+  reason: string,
+): FeatureFlag => {
   const flag = db.flags.find((item) => item.id === flagId)
   if (!flag) throw new Error('功能开关不存在')
-  const before = `${flag.status} / ${flag.rolloutPercentage}%`
+  const previousPercentage = flag.rolloutPercentage
+  const before = `${flag.status} / ${previousPercentage}%`
   flag.status = 'rolled-back'
   flag.enabled = false
   flag.rolloutPercentage = 0
-  flag.updatedAt = new Date().toISOString()
+  flag.updatedAt = nowIso()
   flag.lastChangedBy = actor
-  flag.rolloutSteps.forEach((step) => {
-    if (step.status === 'running') step.status = 'paused'
-  })
+  pauseRunningSteps(flag)
+  if (flag.approval && !flag.approval.invalidated) {
+    flag.approval.invalidated = true
+    flag.approval.invalidatedAt = nowIso()
+    flag.approval.invalidatedReason = '回滚后审批自动失效'
+  }
   db.audit.unshift({
-    id: `audit-${Date.now()}`,
+    id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     flagId,
     flagKey: flag.key,
     action: 'rolled-back',
@@ -439,11 +714,195 @@ export const rollbackFlag = (flagId: string, actor: string, reason: string): Fea
     summary: reason,
     before,
     after: 'rolled-back / 0%',
-    affectedUsers: Math.round(980000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
+    affectedUsers: Math.round(900000 * (previousPercentage / 100)),
+    createdAt: nowIso(),
+  })
+  return flag
+}
+
+export const rollbackFlag = (flagId: string, actor: string, reason: string): FeatureFlag => {
+  const db = readDatabase()
+  const flag = rollbackFlagInto(db, flagId, actor, reason)
+  writeDatabase(db)
+  return flag
+}
+
+// ---------------------------------------------------------------------------
+// 冻结期允许的操作：补监控（不改变发布配置指纹，不会使审批失效）
+// ---------------------------------------------------------------------------
+
+export const addMetric = (flagId: string, actor: string, metricName: string): FeatureFlag => {
+  const db = readDatabase()
+  const flag = db.flags.find((item) => item.id === flagId)
+  if (!flag) throw new Error('功能开关不存在')
+  const name = metricName.trim()
+  if (!name) throw new Error('指标名不能为空')
+  if (flag.metricNames.includes(name)) throw new Error('该监控指标已存在')
+  flag.metricNames.push(name)
+  flag.updatedAt = nowIso()
+  flag.lastChangedBy = actor
+  db.audit.unshift({
+    id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    flagId,
+    flagKey: flag.key,
+    action: 'metric-added',
+    actor,
+    summary: `冻结观察期补充监控指标 ${name}，未改变发布配置，审批保持有效。`,
+    affectedUsers: Math.round(900000 * (flag.rolloutPercentage / 100)),
+    createdAt: nowIso(),
   })
   writeDatabase(db)
   return flag
+}
+
+// ---------------------------------------------------------------------------
+// outbox：一次操作可连带多个开关、审计和报告；失败保留未完成项，支持重试 / 重开续跑
+// ---------------------------------------------------------------------------
+
+const createReportInto = (
+  db: Database,
+  step: OutboxStep,
+  rolledBackFlags: Map<string, FeatureFlag>,
+  operation: OutboxOperation,
+): ReleaseReport => {
+  const items = operation.steps
+    .filter((item) => item.type === 'rollback-flag' && item.flagId)
+    .map((item) => ({
+      flagId: item.flagId as string,
+      flagKey: db.flags.find((flag) => flag.id === item.flagId)?.key ?? (item.flagId as string),
+      reason: item.reason ?? '',
+    }))
+  const report: ReleaseReport = {
+    id: `report-${Date.now()}`,
+    title: step.reportTitle ?? operation.title,
+    kind: 'batch-rollback',
+    actor: '林默',
+    detail: `批量回滚 ${rolledBackFlags.size} 个开关并归档审计与发布报告。`,
+    createdAt: nowIso(),
+    items,
+  }
+  db.reports.unshift(report)
+  const firstFlagId = items[0]?.flagId ?? ''
+  db.audit.unshift({
+    id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    flagId: firstFlagId,
+    flagKey: items.map((item) => item.flagKey).join(', ') || '批量操作',
+    action: 'report-archived',
+    actor: '林默',
+    summary: `已归档发布报告《${report.title}》，覆盖 ${items.length} 个开关。`,
+    affectedUsers: 0,
+    createdAt: report.createdAt,
+  })
+  return report
+}
+
+/** 执行 outbox 中所有未完成步骤；失败步骤保留 failed 与尝试次数，供重试或下次重开续跑 */
+export const resumeOutbox = (): { processed: number; failed: number } => {
+  let db = readDatabase()
+  let processed = 0
+  let failed = 0
+  const rolledBackInRun = new Map<string, FeatureFlag>()
+
+  for (const operation of db.outbox) {
+    for (const step of operation.steps) {
+      if (step.status === 'done') continue
+      step.attempts += 1
+      step.lastAttemptedAt = nowIso()
+      const failure = (message: string): { processed: number; failed: number } => {
+        step.status = 'failed'
+        step.error = message
+        failed += 1
+        // 业务写入失败：丢弃本次内存改动，仅把 outbox 进度（未完成项 + 尝试次数）可靠落盘
+        const fresh = readDatabase()
+        const targetOp = fresh.outbox.find((item) => item.id === operation.id)
+        const targetStep = targetOp?.steps.find((item) => item.id === step.id)
+        if (targetStep) {
+          targetStep.attempts = step.attempts
+          targetStep.lastAttemptedAt = step.lastAttemptedAt
+          targetStep.status = 'failed'
+          targetStep.error = message
+        }
+        persistDatabase(fresh)
+        return { processed, failed }
+      }
+
+      try {
+        if (step.type === 'rollback-flag') {
+          if (!step.flagId) throw new Error('步骤缺少开关 ID')
+          const target = db.flags.find((flag) => flag.id === step.flagId)
+          // 幂等：重跑已回滚的步骤时直接标记完成，不重复写审计
+          if (target?.status === 'rolled-back') {
+            step.status = 'done'
+            step.error = undefined
+            processed += 1
+            continue
+          }
+          const flag = rollbackFlagInto(
+            db,
+            step.flagId,
+            step.actor ?? '林默',
+            step.reason ?? '批量回滚操作',
+          )
+          rolledBackInRun.set(flag.id, flag)
+        } else if (step.type === 'create-report') {
+          createReportInto(db, step, rolledBackInRun, operation)
+        }
+        // 先标记完成再提交：步骤状态与业务数据（开关 / 审计 / 报告）原子落盘
+        step.status = 'done'
+        step.error = undefined
+        writeDatabase(db)
+        processed += 1
+      } catch (error) {
+        // 提交失败后内存库已不可信，后续步骤基于磁盘最新状态继续
+        return failure(error instanceof Error ? error.message : '步骤执行失败')
+      }
+    }
+  }
+
+  return { processed, failed }
+}
+
+/** 登记一次批量操作（多个开关回滚 + 归档报告），并立即尝试执行 */
+export const enqueueBatchRollback = (params: {
+  flagIds: string[]
+  reason: string
+  actor: string
+}): OutboxOperation => {
+  const db = readDatabase()
+  const targets = params.flagIds
+    .map((flagId) => db.flags.find((flag) => flag.id === flagId))
+    .filter((flag): flag is FeatureFlag => Boolean(flag))
+  if (targets.length === 0) throw new Error('请至少选择一个开关')
+
+  const operationId = `op-${Date.now()}`
+  const steps: OutboxStep[] = [
+    ...targets.map((flag, index) => ({
+      id: `${operationId}-step-${index}`,
+      type: 'rollback-flag' as const,
+      status: 'pending' as const,
+      attempts: 0,
+      flagId: flag.id,
+      actor: params.actor,
+      reason: params.reason,
+    })),
+    {
+      id: `${operationId}-step-report`,
+      type: 'create-report' as const,
+      status: 'pending' as const,
+      attempts: 0,
+      reportTitle: `批量回滚报告 ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`,
+    },
+  ]
+  const operation: OutboxOperation = {
+    id: operationId,
+    title: `批量回滚 ${targets.length} 个开关`,
+    createdAt: nowIso(),
+    steps,
+  }
+  db.outbox.unshift(operation)
+  // 入队本身必须可靠落盘，不经过故障开关
+  persistDatabase(db)
+  return operation
 }
 
 export const getDashboardStats = (): DashboardData => {

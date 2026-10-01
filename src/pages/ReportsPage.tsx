@@ -20,8 +20,9 @@ import {
 } from '@mui/material'
 import DownloadOutlinedIcon from '@mui/icons-material/DownloadOutlined'
 import AssessmentOutlinedIcon from '@mui/icons-material/AssessmentOutlined'
-import { useGetAuditQuery, useGetDashboardQuery, useGetFlagsQuery, useGetIssuesQuery } from '@/services/flagApi'
+import { useGetAuditQuery, useGetDashboardQuery, useGetFlagsQuery, useGetIssuesQuery, useGetReportsQuery } from '@/services/flagApi'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
+import { isFreezeActive } from '@/services/database'
 
 const escapeCsv = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`
 
@@ -32,6 +33,7 @@ export function ReportsPage() {
   const { data: dashboard } = useGetDashboardQuery()
   const { data: issues = [] } = useGetIssuesQuery({})
   const { data: audit = [] } = useGetAuditQuery({})
+  const { data: reports = [] } = useGetReportsQuery()
 
   const reportFlags = useMemo(
     () => flags.filter((flag) => !environment || flag.environment === environment),
@@ -40,7 +42,7 @@ export function ReportsPage() {
 
   const exportReport = () => {
     const rows = [
-      ['开关Key', '名称', '环境', '状态', '灰度比例', '负责人', '团队', '受众规则', '依赖数', '监控指标', '回滚条件', '预计影响用户'],
+      ['开关Key', '名称', '环境', '状态', '灰度比例', '负责人', '团队', '受众规则', '依赖数', '监控指标', '回滚条件', '审批人', '审批时间', '冻结截止', '审批状态', '预计影响用户'],
       ...reportFlags.map((flag) => [
         flag.key,
         flag.name,
@@ -53,10 +55,14 @@ export function ReportsPage() {
         flag.dependencies.length,
         flag.metricNames.join('|'),
         flag.rollbackConditions.join('|'),
+        flag.approval?.reviewer ?? '',
+        flag.approval ? flag.approval.approvedAt.slice(0, 16).replace('T', ' ') : '',
+        flag.approval?.freezeUntil ? flag.approval.freezeUntil.slice(0, 16).replace('T', ' ') : '',
+        !flag.approval ? '未审批' : flag.approval.invalidated ? `已失效：${flag.approval.invalidatedReason ?? ''}` : isFreezeActive(flag) ? '冻结观察期' : '有效',
         Math.round(980000 * (flag.rolloutPercentage / 100)),
       ]),
     ]
-    const csv = `\uFEFF${rows.map((row) => row.map(escapeCsv).join(',')).join('\n')}`
+    const csv = `﻿${rows.map((row) => row.map(escapeCsv).join(',')).join('\n')}`
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
     const anchor = document.createElement('a')
     anchor.href = url
@@ -77,7 +83,7 @@ export function ReportsPage() {
         <Box>
           <Typography variant="h2">发布报告</Typography>
           <Typography color="text.secondary">
-            汇总开关配置、影响评审问题、灰度状态与审计轨迹，导出可归档的发布报告。
+            汇总开关配置、审批与冻结、影响问题、灰度状态与审计轨迹；批量操作归档的报告可在此追溯。
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -106,9 +112,59 @@ export function ReportsPage() {
         </Box>
         <Box><Typography variant="caption">生产已启用</Typography><Typography className="summary-value">{reportFlags.filter((flag) => flag.enabled).length}</Typography></Box>
         <Box><Typography variant="caption">未解决阻断项</Typography><Typography className="summary-value danger">{riskFlags.length}</Typography></Box>
+        <Box><Typography variant="caption">冻结观察期</Typography><Typography className="summary-value">{reportFlags.filter((flag) => isFreezeActive(flag)).length}</Typography></Box>
         <Box><Typography variant="caption">审计事件</Typography><Typography className="summary-value">{audit.length}</Typography></Box>
         <Box><Typography variant="caption">影响用户</Typography><Typography className="summary-value">{(dashboard?.affectedUsers ?? 0).toLocaleString()}</Typography></Box>
       </Box>
+
+      <Card sx={{ mb: 2 }}>
+        <CardContent>
+          <Typography variant="h3" sx={{ mb: 1.5 }}>批量操作归档报告</Typography>
+          <TableContainer>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>报告</TableCell>
+                  <TableCell>归档时间 / 操作人</TableCell>
+                  <TableCell>覆盖开关</TableCell>
+                  <TableCell>说明</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {reports.map((report) => (
+                  <TableRow key={report.id} hover>
+                    <TableCell>
+                      <Typography variant="body2" fontWeight={700}>{report.title}</Typography>
+                      <Chip size="small" variant="outlined" label={report.kind === 'batch-rollback' ? '批量回滚' : report.kind} />
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="body2">{report.createdAt.slice(0, 16).replace('T', ' ')}</Typography>
+                      <Typography variant="caption" color="text.secondary">{report.actor}</Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                        {report.items.map((item) => (
+                          <Chip key={item.flagId} size="small" label={item.flagKey} />
+                        ))}
+                      </Stack>
+                    </TableCell>
+                    <TableCell sx={{ maxWidth: 360 }}>
+                      <Typography variant="body2">{report.detail}</Typography>
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {reports.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={4} align="center" sx={{ py: 4 }} color="text.secondary">
+                      暂无归档报告；在「审计与回滚」页执行批量回滚后会自动生成。
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </CardContent>
+      </Card>
 
       <Box className="report-grid">
         <Card>
@@ -154,7 +210,7 @@ export function ReportsPage() {
                   <TableCell>功能开关</TableCell>
                   <TableCell>环境 / 状态</TableCell>
                   <TableCell>灰度</TableCell>
-                  <TableCell>影响规则</TableCell>
+                  <TableCell>审批与冻结</TableCell>
                   <TableCell>监控与回滚</TableCell>
                   <TableCell>最后变更</TableCell>
                 </TableRow>
@@ -171,7 +227,23 @@ export function ReportsPage() {
                       <Box sx={{ mt: 0.5 }}><FlagStatusChip status={flag.status} /></Box>
                     </TableCell>
                     <TableCell>{flag.rolloutPercentage}%</TableCell>
-                    <TableCell>{flag.audienceRules.length} 条规则 · {flag.regions.length} 地区</TableCell>
+                    <TableCell>
+                      {flag.approval ? (
+                        <>
+                          <Typography variant="body2">{flag.approval.reviewer} 批准</Typography>
+                          {flag.approval.freezeUntil && (
+                            <Typography variant="caption" color={isFreezeActive(flag) ? 'warning.main' : 'text.secondary'}>
+                              冻结至 {flag.approval.freezeUntil.slice(0, 16).replace('T', ' ')}
+                            </Typography>
+                          )}
+                          {flag.approval.invalidated && (
+                            <Chip size="small" color="error" variant="outlined" label="审批已失效 · 待复核" />
+                          )}
+                        </>
+                      ) : (
+                        <Typography variant="caption" color="text.secondary">尚未批准</Typography>
+                      )}
+                    </TableCell>
                     <TableCell>{flag.metricNames.length} 指标 · {flag.rollbackConditions.length} 回滚条件</TableCell>
                     <TableCell>
                       <Typography variant="body2">{flag.lastChangedBy}</Typography>

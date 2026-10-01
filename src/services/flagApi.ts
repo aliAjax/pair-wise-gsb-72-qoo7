@@ -1,8 +1,13 @@
 import { createApi, fakeBaseQuery } from '@reduxjs/toolkit/query/react'
 import {
+  addMetric,
   applyReview,
+  buildConfigHash,
+  enqueueBatchRollback,
   getDashboardStats,
+  invalidateApproval,
   readDatabase,
+  resumeOutbox,
   rollbackFlag,
   writeDatabase,
 } from '@/services/database'
@@ -12,16 +17,20 @@ import type {
   FeatureFlag,
   FlagFilter,
   ImpactIssue,
+  OutboxOperation,
+  ReleaseReport,
   ReviewPayload,
 } from '@/types'
 
 const delay = (milliseconds = 180) =>
   new Promise((resolve) => window.setTimeout(resolve, milliseconds))
 
+const uniqueId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+
 export const flagApi = createApi({
   reducerPath: 'flagApi',
   baseQuery: fakeBaseQuery<{ message: string }>(),
-  tagTypes: ['Flags', 'Flag', 'Issues', 'Audit', 'Dashboard'],
+  tagTypes: ['Flags', 'Flag', 'Issues', 'Audit', 'Dashboard', 'Outbox', 'Reports'],
   endpoints: (builder) => ({
     getDashboard: builder.query<DashboardData, void>({
       async queryFn() {
@@ -65,9 +74,14 @@ export const flagApi = createApi({
         const next = { ...flag, updatedAt: new Date().toISOString() }
         if (index >= 0) {
           const before = db.flags[index]
+          // 审批后若发布面配置（受众/依赖/版本/回滚条件/阶段定义）发生改动，审批立即失效
+          let drifted = false
+          if (before.approval && !before.approval.invalidated) {
+            drifted = buildConfigHash(next) !== before.approval.configHash
+          }
           db.flags[index] = next
           db.audit.unshift({
-            id: `audit-${Date.now()}`,
+            id: uniqueId('audit'),
             flagId: flag.id,
             flagKey: flag.key,
             action: 'updated',
@@ -78,10 +92,18 @@ export const flagApi = createApi({
             affectedUsers: Math.round(900000 * (next.rolloutPercentage / 100)),
             createdAt: new Date().toISOString(),
           })
+          if (drifted) {
+            invalidateApproval(
+              db,
+              next,
+              '发布负责人批准后配置被改动（受众 / 依赖 / 版本 / 回滚条件 / 灰度阶段）',
+              flag.lastChangedBy,
+            )
+          }
         } else {
           db.flags.unshift(next)
           db.audit.unshift({
-            id: `audit-${Date.now()}`,
+            id: uniqueId('audit'),
             flagId: next.id,
             flagKey: next.key,
             action: 'created',
@@ -107,7 +129,7 @@ export const flagApi = createApi({
         flag.updatedAt = new Date().toISOString()
         flag.lastChangedBy = actor
         db.audit.unshift({
-          id: `audit-${Date.now()}`,
+          id: uniqueId('audit'),
           flagId: id,
           flagKey: flag.key,
           action: 'submitted',
@@ -157,8 +179,50 @@ export const flagApi = createApi({
         'Flags',
         'Dashboard',
         'Audit',
+        'Outbox',
+        'Reports',
         { type: 'Flag', id: arg.id },
       ],
+    }),
+    /** 冻结观察期补充监控：不改变发布配置指纹，审批保持有效 */
+    addMetric: builder.mutation<FeatureFlag, { id: string; actor: string; metricName: string }>({
+      async queryFn({ id, actor, metricName }) {
+        await delay(220)
+        try {
+          return { data: addMetric(id, actor, metricName) }
+        } catch (error) {
+          return { error: { message: error instanceof Error ? error.message : '补充监控失败' } }
+        }
+      },
+      invalidatesTags: (_result, _error, arg) => [
+        'Flags',
+        'Audit',
+        { type: 'Flag', id: arg.id },
+      ],
+    }),
+    resolveIssue: builder.mutation<ImpactIssue, { id: string; actor: string }>({
+      async queryFn({ id, actor }) {
+        await delay(180)
+        const db = readDatabase()
+        const issue = db.issues.find((item) => item.id === id)
+        if (!issue) return { error: { message: '影响问题不存在' } }
+        issue.resolved = true
+        db.audit.unshift({
+          id: uniqueId('audit'),
+          flagId: issue.flagId,
+          flagKey: issue.flagKey,
+          action: 'updated',
+          actor,
+          summary: `影响问题已处理：${issue.title}`,
+          before: '未解决',
+          after: '已解决',
+          affectedUsers: 0,
+          createdAt: new Date().toISOString(),
+        })
+        writeDatabase(db)
+        return { data: issue }
+      },
+      invalidatesTags: ['Issues', 'Audit', 'Dashboard'],
     }),
     getIssues: builder.query<ImpactIssue[], { category?: string; resolved?: boolean }>({
       async queryFn(filters) {
@@ -184,6 +248,49 @@ export const flagApi = createApi({
       },
       providesTags: ['Audit'],
     }),
+    getOutbox: builder.query<OutboxOperation[], void>({
+      async queryFn() {
+        await delay()
+        return { data: readDatabase().outbox }
+      },
+      providesTags: ['Outbox'],
+    }),
+    getReports: builder.query<ReleaseReport[], void>({
+      async queryFn() {
+        await delay()
+        return { data: readDatabase().reports }
+      },
+      providesTags: ['Reports'],
+    }),
+    /** 登记一次连带多开关 + 审计 + 报告的批量操作，立即尝试续跑 */
+    enqueueBatchRollback: builder.mutation<
+      OutboxOperation,
+      { flagIds: string[]; reason: string; actor: string }
+    >({
+      async queryFn(payload) {
+        await delay(120)
+        try {
+          const operation = enqueueBatchRollback(payload)
+          resumeOutbox()
+          return { data: operation }
+        } catch (error) {
+          return { error: { message: error instanceof Error ? error.message : '批量操作登记失败' } }
+        }
+      },
+      invalidatesTags: ['Outbox', 'Flags', 'Audit', 'Reports', 'Dashboard'],
+    }),
+    /** 重试所有未完成步骤（页面重开时也会自动触发） */
+    resumeOutbox: builder.mutation<{ processed: number; failed: number }, void>({
+      async queryFn() {
+        await delay(160)
+        try {
+          return { data: resumeOutbox() }
+        } catch (error) {
+          return { error: { message: error instanceof Error ? error.message : '续跑失败' } }
+        }
+      },
+      invalidatesTags: ['Outbox', 'Flags', 'Audit', 'Reports', 'Dashboard'],
+    }),
   }),
 })
 
@@ -195,6 +302,12 @@ export const {
   useSubmitForReviewMutation,
   useReviewFlagMutation,
   useRollbackFlagMutation,
+  useAddMetricMutation,
+  useResolveIssueMutation,
   useGetIssuesQuery,
   useGetAuditQuery,
+  useGetOutboxQuery,
+  useGetReportsQuery,
+  useEnqueueBatchRollbackMutation,
+  useResumeOutboxMutation,
 } = flagApi
